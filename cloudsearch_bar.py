@@ -617,11 +617,33 @@ class SearchBar(QWidget):
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
+    def _force_foreground(self):
+        """
+        Use the AttachThreadInput trick to steal focus from any foreground window.
+        Qt's activateWindow() alone is blocked by Windows focus-stealing prevention
+        when invoked from a background process (e.g. while a terminal has focus).
+        """
+        import ctypes
+        user32   = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd             = int(self.winId())
+        foreground_hwnd  = user32.GetForegroundWindow()
+        foreground_tid   = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+        our_tid          = kernel32.GetCurrentThreadId()
+        if foreground_tid and foreground_tid != our_tid:
+            user32.AttachThreadInput(foreground_tid, our_tid, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            user32.AttachThreadInput(foreground_tid, our_tid, False)
+        else:
+            user32.SetForegroundWindow(hwnd)
+
     def _show_and_focus(self):
         self._clear_results()
         self._center()
         self.setWindowOpacity(0.0)
         self.show()
+        self._force_foreground()
         self.raise_()
         self.activateWindow()
         self.line_edit.setFocus()
