@@ -241,13 +241,17 @@ def sync_autostart(enable: bool) -> bool:
 _DISTANCE_RE = re.compile(r'^distance\s+(.+?)\s+to\s+(.+)$', re.IGNORECASE)
 
 
+_US_ZIP_RE = re.compile(r'^\d{5}(-\d{4})?$')
+
 def _nominatim_geocode(place: str):
     """Return (lat, lon) floats or None. Uses OSM Nominatim, no API key."""
     try:
+        country = "&countrycodes=us" if _US_ZIP_RE.match(place.strip()) else ""
         url = (
             "https://nominatim.openstreetmap.org/search?q="
             + urllib.parse.quote(place)
             + "&format=json&limit=1"
+            + country
         )
         req = urllib.request.Request(url, headers={"User-Agent": "CloudSearchBar/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
