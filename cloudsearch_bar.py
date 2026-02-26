@@ -263,8 +263,18 @@ def _nominatim_geocode(place: str):
     return None
 
 
+def _haversine(lat1, lon1, lat2, lon2):
+    """Return straight-line distance in miles between two lat/lon points."""
+    import math
+    R = 3958.8  # Earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
 def _osrm_route(lat1, lon1, lat2, lon2):
-    """Return {distance_mi, distance_km, time_str} or None. Uses public OSRM."""
+    """Return {distance_mi, distance_km, time_str, aerial} or None. Uses public OSRM with haversine fallback."""
     try:
         url = (
             f"https://router.project-osrm.org/route/v1/driving/"
@@ -281,9 +291,12 @@ def _osrm_route(lat1, lon1, lat2, lon2):
         hours, rem = divmod(seconds, 3600)
         mins = rem // 60
         time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
-        return {"distance_mi": miles, "distance_km": km, "time_str": time_str}
+        return {"distance_mi": miles, "distance_km": km, "time_str": time_str, "aerial": False}
     except Exception:
         pass
+    # Haversine fallback — aerial (straight-line) distance
+    miles = _haversine(lat1, lon1, lat2, lon2)
+    return {"distance_mi": miles, "distance_km": miles * 1.60934, "aerial": True}
     return None
 
 
@@ -374,7 +387,7 @@ class PreviewPopup(QWidget):
 
 class _Signals(QObject):
     show_window    = pyqtSignal()
-    search_results = pyqtSignal(list)
+    search_results = pyqtSignal(object)    # emits (list, gen)
     distance_result = pyqtSignal(object)   # emits a dict
 
 
@@ -851,15 +864,15 @@ class SearchBar(QWidget):
             self._run_distance_search(m.group(1).strip(), m.group(2).strip(), self._search_gen)
             return
         if LOCAL_ENABLED:
-            self._run_local_search()
+            self._run_local_search(self._search_gen)
 
-    def _run_local_search(self):
+    def _run_local_search(self, gen: int):
         query = self.line_edit.text().strip()
         if not query:
             return
         def _worker():
             results = search_local_files(query, LOCAL_PATHS, LOCAL_MAX)
-            self._signals.search_results.emit(results)
+            self._signals.search_results.emit((results, gen))
         threading.Thread(target=_worker, daemon=True).start()
 
     def _run_distance_search(self, origin: str, dest: str, gen: int):
@@ -901,8 +914,11 @@ class SearchBar(QWidget):
         if "distance_mi" in info:
             mi  = info["distance_mi"]
             km  = info["distance_km"]
-            t   = info["time_str"]
-            row1_text = f"  \U0001f5fa  {mi:.0f} mi · {km:.0f} km · {t} driving"
+            if info.get("aerial"):
+                row1_text = f"  \U0001f5fa  ~{mi:.0f} mi · ~{km:.0f} km (aerial, driving unavailable)"
+            else:
+                t   = info["time_str"]
+                row1_text = f"  \U0001f5fa  {mi:.0f} mi · {km:.0f} km · {t} driving"
             row1_data = maps_link
         else:
             row1_text = "  \u26a0  Could not calculate — Open in Google Maps"
@@ -928,7 +944,10 @@ class SearchBar(QWidget):
         self._set_content_height(WINDOW_HEIGHT + list_height)
         self._style_input(results_open=True)
 
-    def _display_results(self, results: list):
+    def _display_results(self, payload):
+        results, gen = payload
+        if gen != self._search_gen:
+            return   # stale local search result
         query = self.line_edit.text().strip()
         if not query:
             return
