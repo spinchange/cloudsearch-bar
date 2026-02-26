@@ -32,9 +32,10 @@ import keyboard
 from rapidfuzz import fuzz as rfuzz
 
 from PyQt6.QtWidgets import (
-    QApplication, QLineEdit, QVBoxLayout, QWidget,
+    QApplication, QLineEdit, QVBoxLayout, QHBoxLayout, QWidget,
     QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem,
     QFrame, QGraphicsDropShadowEffect, QLabel, QFileIconProvider,
+    QDialog, QFormLayout, QGroupBox, QSpinBox, QCheckBox, QPushButton,
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QTimer, QSize,
@@ -284,6 +285,230 @@ class PreviewPopup(QWidget):
 class _Signals(QObject):
     show_window    = pyqtSignal()
     search_results = pyqtSignal(list)
+
+
+# ── Settings Dialog ───────────────────────────────────────────────────────────
+
+class SettingsDialog(QDialog):
+    def __init__(self, search_bar: "SearchBar"):
+        super().__init__(None)
+        self._bar = search_bar
+        self.setWindowTitle("CloudSearchBar — Settings")
+        icon_path = APP_DIR / "icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self.setMinimumWidth(440)
+        self._build_ui()
+        self._load_values()
+        self.setStyleSheet("""
+            QDialog {
+                background: #f8f9fa;
+            }
+            QGroupBox {
+                font-weight: bold;
+                color: #3c4043;
+                border: 1px solid #dadce0;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+                color: #1a73e8;
+            }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #dadce0;
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: #3c4043;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #4285F4;
+            }
+            QSpinBox {
+                background: #ffffff;
+                border: 1px solid #dadce0;
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: #3c4043;
+                font-size: 13px;
+            }
+            QCheckBox {
+                color: #3c4043;
+                font-size: 13px;
+            }
+            QLabel {
+                color: #3c4043;
+                font-size: 13px;
+            }
+            QPushButton {
+                background: #4285F4;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 20px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background: #1a73e8;
+            }
+            QPushButton#cancel_btn {
+                background: #ffffff;
+                color: #3c4043;
+                border: 1px solid #dadce0;
+            }
+            QPushButton#cancel_btn:hover {
+                background: #f1f3f4;
+            }
+        """)
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setSpacing(12)
+        outer.setContentsMargins(16, 16, 16, 16)
+
+        # ── Search group
+        search_box = QGroupBox("Search")
+        search_form = QFormLayout(search_box)
+        search_form.setSpacing(8)
+        search_form.setContentsMargins(12, 16, 12, 12)
+
+        self._hotkey_edit = QLineEdit()
+        self._hotkey_edit.setPlaceholderText("e.g. ctrl+space")
+        search_form.addRow("Hotkey:", self._hotkey_edit)
+
+        self._browser_edit = QLineEdit()
+        self._browser_edit.setPlaceholderText("blank = system default")
+        search_form.addRow("Browser:", self._browser_edit)
+
+        self._account_spin = QSpinBox()
+        self._account_spin.setRange(0, 9)
+        search_form.addRow("Google account index:", self._account_spin)
+
+        outer.addWidget(search_box)
+
+        # ── Local Search group
+        local_box = QGroupBox("Local Search")
+        local_form = QFormLayout(local_box)
+        local_form.setSpacing(8)
+        local_form.setContentsMargins(12, 16, 12, 12)
+
+        self._local_enabled_check = QCheckBox()
+        local_form.addRow("Enabled:", self._local_enabled_check)
+
+        self._local_max_spin = QSpinBox()
+        self._local_max_spin.setRange(1, 20)
+        local_form.addRow("Max file results:", self._local_max_spin)
+
+        self._local_paths_edit = QLineEdit()
+        self._local_paths_edit.setPlaceholderText("blank = everywhere  (comma-separated paths)")
+        local_form.addRow("Search paths:", self._local_paths_edit)
+
+        outer.addWidget(local_box)
+
+        # ── Startup group
+        startup_box = QGroupBox("Startup")
+        startup_form = QFormLayout(startup_box)
+        startup_form.setSpacing(8)
+        startup_form.setContentsMargins(12, 16, 12, 12)
+
+        self._autostart_check = QCheckBox()
+        startup_form.addRow("Launch at startup:", self._autostart_check)
+
+        outer.addWidget(startup_box)
+
+        # ── Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("cancel_btn")
+        cancel_btn.clicked.connect(self.reject)
+
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._save)
+
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        outer.addLayout(btn_row)
+
+    def _load_values(self):
+        self._hotkey_edit.setText(HOTKEY)
+        self._browser_edit.setText(BROWSER)
+        self._account_spin.setValue(ACCOUNT_INDEX)
+        self._local_enabled_check.setChecked(LOCAL_ENABLED)
+        self._local_max_spin.setValue(LOCAL_MAX)
+        self._local_paths_edit.setText(", ".join(LOCAL_PATHS))
+        self._autostart_check.setChecked(AUTOSTART)
+
+    def _save(self):
+        global HOTKEY, BROWSER, ACCOUNT_INDEX, SEARCH_URL
+        global LOCAL_ENABLED, LOCAL_MAX, LOCAL_PATHS, AUTOSTART
+
+        old_hotkey    = HOTKEY
+        old_autostart = AUTOSTART
+
+        # Read widget values
+        new_hotkey        = self._hotkey_edit.text().strip() or HOTKEY
+        new_browser       = self._browser_edit.text().strip()
+        new_account_index = self._account_spin.value()
+        new_local_enabled = self._local_enabled_check.isChecked()
+        new_local_max     = self._local_max_spin.value()
+        raw_paths         = self._local_paths_edit.text().strip()
+        new_local_paths   = [p.strip() for p in raw_paths.split(",") if p.strip()]
+        new_autostart     = self._autostart_check.isChecked()
+
+        # Write config file cleanly
+        new_cfg = configparser.ConfigParser()
+        new_cfg["Search"] = {
+            "hotkey":        new_hotkey,
+            "account_index": str(new_account_index),
+            "browser":       new_browser,
+        }
+        new_cfg["Window"] = {
+            "width":  str(WINDOW_WIDTH),
+            "height": str(WINDOW_HEIGHT),
+        }
+        new_cfg["LocalSearch"] = {
+            "enabled":     "true" if new_local_enabled else "false",
+            "max_results": str(new_local_max),
+            "paths":       ", ".join(new_local_paths),
+        }
+        new_cfg["Startup"] = {
+            "autostart": "true" if new_autostart else "false",
+        }
+        with open(CONFIG_PATH, "w") as f:
+            new_cfg.write(f)
+
+        # Update globals
+        HOTKEY        = new_hotkey
+        BROWSER       = new_browser
+        ACCOUNT_INDEX = new_account_index
+        _account_path = f"/u/{ACCOUNT_INDEX}/" if ACCOUNT_INDEX > 0 else "/"
+        SEARCH_URL    = f"https://cloudsearch.google.com{_account_path}cloudsearch/search?q={{}}"
+        LOCAL_ENABLED = new_local_enabled
+        LOCAL_MAX     = new_local_max
+        LOCAL_PATHS   = new_local_paths
+        AUTOSTART     = new_autostart
+
+        # Rebind hotkey if changed
+        if new_hotkey != old_hotkey:
+            try:
+                keyboard.remove_hotkey(old_hotkey)
+            except Exception:
+                pass
+            keyboard.add_hotkey(new_hotkey, self._bar._signals.show_window.emit)
+
+        # Sync autostart registry if changed
+        if new_autostart != old_autostart:
+            sync_autostart(new_autostart)
+
+        self.accept()
 
 
 # ── Search Bar ────────────────────────────────────────────────────────────────
@@ -680,7 +905,8 @@ class SearchBar(QWidget):
         self._animate_opacity(self.windowOpacity(), 0.0, on_finish=_finish)
 
     def _open_settings(self):
-        os.startfile(str(CONFIG_PATH))
+        dlg = SettingsDialog(self)
+        dlg.exec()
 
     def _on_enter(self):
         if self.results_list.isVisible():
