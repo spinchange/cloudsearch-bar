@@ -1,0 +1,6 @@
+build/
+dist/
+history.json
+query_history.json
+*.pyc
+__pycache__/
