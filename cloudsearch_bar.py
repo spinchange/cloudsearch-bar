@@ -267,7 +267,7 @@ def _osrm_route(lat1, lon1, lat2, lon2):
             f"{lon1},{lat1};{lon2},{lat2}?overview=false"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "CloudSearchBar/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         route = data["routes"][0]
         metres  = route["distance"]
@@ -607,6 +607,7 @@ class SearchBar(QWidget):
         self._signals.show_window.connect(self._show_and_focus)
         self._signals.search_results.connect(self._display_results)
         self._signals.distance_result.connect(self._display_distance_result)
+        self._search_gen = 0   # incremented each query; stale threads compare and discard
         self._anim = None
         self.line_edit = None      # guard for eventFilter before _init_ui completes
         self.results_list = None   # guard for eventFilter before _init_ui completes
@@ -840,9 +841,10 @@ class SearchBar(QWidget):
         query = self.line_edit.text().strip()
         if not query:
             return
+        self._search_gen += 1
         m = _DISTANCE_RE.match(query)
         if m:
-            self._run_distance_search(m.group(1).strip(), m.group(2).strip())
+            self._run_distance_search(m.group(1).strip(), m.group(2).strip(), self._search_gen)
             return
         if LOCAL_ENABLED:
             self._run_local_search()
@@ -856,9 +858,9 @@ class SearchBar(QWidget):
             self._signals.search_results.emit(results)
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _run_distance_search(self, origin: str, dest: str):
+    def _run_distance_search(self, origin: str, dest: str, gen: int):
         def _worker():
-            info = {"origin": origin, "dest": dest}
+            info = {"origin": origin, "dest": dest, "_gen": gen}
             o = _nominatim_geocode(origin)
             d = _nominatim_geocode(dest)
             if o and d:
@@ -869,6 +871,8 @@ class SearchBar(QWidget):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _display_distance_result(self, info: dict):
+        if info.get("_gen") != self._search_gen:
+            return   # stale result from a superseded query
         origin = info["origin"]
         dest   = info["dest"]
         maps_link    = _maps_url(origin, dest)
@@ -1116,6 +1120,7 @@ class SearchBar(QWidget):
             return  # header — ignore
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, dict) and "query" in data:
+            self._clear_results()
             self.line_edit.setText(data["query"])
             return
         if isinstance(data, str) and data.startswith("https://"):
