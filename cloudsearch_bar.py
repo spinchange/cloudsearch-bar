@@ -20,9 +20,11 @@ Requires:
 
 import sys
 import os
+import re
 import json
 import webbrowser
 import urllib.parse
+import urllib.request
 import configparser
 import threading
 from pathlib import Path
@@ -95,8 +97,10 @@ SHADOW_MARGIN   = 18
 SHADOW_OFFSET_Y = 6
 ITEM_HEIGHT     = 54
 HEADER_HEIGHT   = 28
-HISTORY_MAX     = 20
-HISTORY_SHOW    = 5
+HISTORY_MAX          = 20
+HISTORY_SHOW         = 5
+QUERY_HISTORY_PATH   = APP_DIR / "query_history.json"
+QUERY_HISTORY_MAX    = 100
 IMAGE_EXTS      = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
 
 
@@ -177,6 +181,26 @@ def add_to_history(path: str):
         pass
 
 
+def load_query_history() -> list:
+    try:
+        with open(QUERY_HISTORY_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_query(query: str):
+    if not query:
+        return
+    entries = load_query_history()
+    entries = [q for q in entries if q.lower() != query.lower()]
+    entries.insert(0, query)
+    try:
+        with open(QUERY_HISTORY_PATH, "w") as f:
+            json.dump(entries[:QUERY_HISTORY_MAX], f, indent=2)
+    except Exception:
+        pass
+
+
 # ── Autostart ─────────────────────────────────────────────────────────────────
 
 def sync_autostart(enable: bool) -> bool:
@@ -210,6 +234,68 @@ def sync_autostart(enable: bool) -> bool:
             return True
     except Exception:
         return False
+
+
+# ── Distance calculator ───────────────────────────────────────────────────────
+
+_DISTANCE_RE = re.compile(r'^distance\s+(.+?)\s+to\s+(.+)$', re.IGNORECASE)
+
+
+def _nominatim_geocode(place: str):
+    """Return (lat, lon) floats or None. Uses OSM Nominatim, no API key."""
+    try:
+        url = (
+            "https://nominatim.openstreetmap.org/search?q="
+            + urllib.parse.quote(place)
+            + "&format=json&limit=1"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "CloudSearchBar/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if data:
+            return (float(data[0]["lat"]), float(data[0]["lon"]))
+    except Exception:
+        pass
+    return None
+
+
+def _osrm_route(lat1, lon1, lat2, lon2):
+    """Return {distance_mi, distance_km, time_str} or None. Uses public OSRM."""
+    try:
+        url = (
+            f"https://router.project-osrm.org/route/v1/driving/"
+            f"{lon1},{lat1};{lon2},{lat2}?overview=false"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "CloudSearchBar/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        route = data["routes"][0]
+        metres  = route["distance"]
+        seconds = int(route["duration"])
+        miles   = metres / 1609.344
+        km      = metres / 1000.0
+        hours, rem = divmod(seconds, 3600)
+        mins = rem // 60
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+        return {"distance_mi": miles, "distance_km": km, "time_str": time_str}
+    except Exception:
+        pass
+    return None
+
+
+def _maps_url(origin: str, dest: str) -> str:
+    return (
+        "https://www.google.com/maps/dir/"
+        + urllib.parse.quote(origin)
+        + "/"
+        + urllib.parse.quote(dest)
+        + "/"
+    )
+
+
+def _flights_url(origin: str, dest: str) -> str:
+    q = urllib.parse.quote(f"Flights from {origin} to {dest}")
+    return f"https://www.google.com/flights?q={q}"
 
 
 # ── Preview popup ─────────────────────────────────────────────────────────────
@@ -285,6 +371,7 @@ class PreviewPopup(QWidget):
 class _Signals(QObject):
     show_window    = pyqtSignal()
     search_results = pyqtSignal(list)
+    distance_result = pyqtSignal(object)   # emits a dict
 
 
 # ── Settings Dialog ───────────────────────────────────────────────────────────
@@ -519,6 +606,7 @@ class SearchBar(QWidget):
         self._signals = _Signals()
         self._signals.show_window.connect(self._show_and_focus)
         self._signals.search_results.connect(self._display_results)
+        self._signals.distance_result.connect(self._display_distance_result)
         self._anim = None
         self.line_edit = None      # guard for eventFilter before _init_ui completes
         self.results_list = None   # guard for eventFilter before _init_ui completes
@@ -579,13 +667,12 @@ class SearchBar(QWidget):
 
         self._set_content_height(WINDOW_HEIGHT)
 
-        # ── Debounce timer for local search
-        if LOCAL_ENABLED:
-            self._search_timer = QTimer()
-            self._search_timer.setSingleShot(True)
-            self._search_timer.setInterval(250)
-            self._search_timer.timeout.connect(self._run_local_search)
-            self.line_edit.textChanged.connect(self._on_text_changed)
+        # ── Debounce timer — drives local search and distance queries
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._fire_search)
+        self.line_edit.textChanged.connect(self._on_text_changed)
 
     def _set_content_height(self, h: int):
         self.container.setFixedHeight(h)
@@ -743,10 +830,22 @@ class SearchBar(QWidget):
     def _on_text_changed(self, text):
         self._search_timer.stop()
         if text.strip():
+            self._show_query_suggestions(text.strip())
             self._search_timer.start()
         else:
             self._clear_results()
             self._show_recently_opened()
+
+    def _fire_search(self):
+        query = self.line_edit.text().strip()
+        if not query:
+            return
+        m = _DISTANCE_RE.match(query)
+        if m:
+            self._run_distance_search(m.group(1).strip(), m.group(2).strip())
+            return
+        if LOCAL_ENABLED:
+            self._run_local_search()
 
     def _run_local_search(self):
         query = self.line_edit.text().strip()
@@ -756,6 +855,70 @@ class SearchBar(QWidget):
             results = search_local_files(query, LOCAL_PATHS, LOCAL_MAX)
             self._signals.search_results.emit(results)
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_distance_search(self, origin: str, dest: str):
+        def _worker():
+            info = {"origin": origin, "dest": dest}
+            o = _nominatim_geocode(origin)
+            d = _nominatim_geocode(dest)
+            if o and d:
+                route = _osrm_route(o[0], o[1], d[0], d[1])
+                if route:
+                    info.update(route)
+            self._signals.distance_result.emit(info)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _display_distance_result(self, info: dict):
+        origin = info["origin"]
+        dest   = info["dest"]
+        maps_link    = _maps_url(origin, dest)
+        flights_link = _flights_url(origin, dest)
+
+        self.results_list.clear()
+
+        # Non-selectable header
+        header_text = f"{origin.title()} → {dest.title()}"
+        h_item = QListWidgetItem(header_text)
+        h_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        h_font = QFont()
+        h_font.setPointSize(9)
+        h_item.setFont(h_font)
+        h_item.setSizeHint(QSize(WINDOW_WIDTH, HEADER_HEIGHT))
+        self.results_list.addItem(h_item)
+
+        f_font = QFont()
+        f_font.setPointSize(10)
+
+        # Row 1 — distance/time or error
+        if "distance_mi" in info:
+            mi  = info["distance_mi"]
+            km  = info["distance_km"]
+            t   = info["time_str"]
+            row1_text = f"  \U0001f5fa  {mi:.0f} mi · {km:.0f} km · {t} driving"
+            row1_data = maps_link
+        else:
+            row1_text = "  \u26a0  Could not calculate — Open in Google Maps"
+            row1_data = maps_link
+
+        row1 = QListWidgetItem(row1_text)
+        row1.setData(Qt.ItemDataRole.UserRole, row1_data)
+        row1.setFont(f_font)
+        row1.setSizeHint(QSize(WINDOW_WIDTH, ITEM_HEIGHT))
+        self.results_list.addItem(row1)
+
+        # Row 2 — Flights
+        row2 = QListWidgetItem("  \u2708  Search Google Flights")
+        row2.setData(Qt.ItemDataRole.UserRole, flights_link)
+        row2.setFont(f_font)
+        row2.setForeground(QColor("#1a73e8"))
+        row2.setSizeHint(QSize(WINDOW_WIDTH, ITEM_HEIGHT))
+        self.results_list.addItem(row2)
+
+        list_height = HEADER_HEIGHT + 2 * ITEM_HEIGHT
+        self.results_list.setFixedHeight(list_height)
+        self.results_list.show()
+        self._set_content_height(WINDOW_HEIGHT + list_height)
+        self._style_input(results_open=True)
 
     def _display_results(self, results: list):
         query = self.line_edit.text().strip()
@@ -781,6 +944,38 @@ class SearchBar(QWidget):
             header="Recently opened",
             cloud_label="Search Cloud Search…",
         )
+
+    def _show_query_suggestions(self, text: str):
+        history = load_query_history()
+        matches = [q for q in history
+                   if q.lower().startswith(text.lower())
+                   and q.lower() != text.lower()][:5]
+        if not matches:
+            return
+        self.results_list.clear()
+
+        h_item = QListWidgetItem("Recent searches")
+        h_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        h_font = QFont()
+        h_font.setPointSize(9)
+        h_item.setFont(h_font)
+        h_item.setSizeHint(QSize(WINDOW_WIDTH, HEADER_HEIGHT))
+        self.results_list.addItem(h_item)
+
+        f_font = QFont()
+        f_font.setPointSize(10)
+        for q in matches:
+            item = QListWidgetItem(f"  \U0001f550  {q}")
+            item.setData(Qt.ItemDataRole.UserRole, {"query": q})
+            item.setFont(f_font)
+            item.setSizeHint(QSize(WINDOW_WIDTH, ITEM_HEIGHT))
+            self.results_list.addItem(item)
+
+        list_height = HEADER_HEIGHT + len(matches) * ITEM_HEIGHT
+        self.results_list.setFixedHeight(list_height)
+        self.results_list.show()
+        self._set_content_height(WINDOW_HEIGHT + list_height)
+        self._style_input(results_open=True)
 
     def _populate_list(self, items: list, header: str, cloud_label: str):
         self.results_list.clear()
@@ -839,7 +1034,7 @@ class SearchBar(QWidget):
 
     def _on_item_hovered(self, item: QListWidgetItem):
         path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        if not path or (isinstance(path, str) and path.startswith("https://")):
             self._preview.hide()
             return
         rect       = self.results_list.visualItemRect(item)
@@ -919,17 +1114,27 @@ class SearchBar(QWidget):
     def _open_result(self, item: QListWidgetItem):
         if not (item.flags() & Qt.ItemFlag.ItemIsSelectable):
             return  # header — ignore
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if path is None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict) and "query" in data:
+            self.line_edit.setText(data["query"])
+            return
+        if isinstance(data, str) and data.startswith("https://"):
+            save_query(self.line_edit.text().strip())
+            webbrowser.open(data)
+            self._hide()
+            return
+        if data is None:
             self._cloud_search()
         else:
-            os.startfile(path)
-            add_to_history(path)
+            save_query(self.line_edit.text().strip())
+            os.startfile(data)
+            add_to_history(data)
             self._hide()
 
     def _cloud_search(self):
         query = self.line_edit.text().strip()
         if query:
+            save_query(query)
             url = SEARCH_URL.format(urllib.parse.quote_plus(query))
             if BROWSER:
                 try:
