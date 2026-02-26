@@ -62,7 +62,7 @@ _DEFAULTS = {
     "Search":      {"hotkey": "ctrl+space", "account_index": "0", "browser": ""},
     "Window":      {"width": "620", "height": "60"},
     "LocalSearch": {"enabled": "true", "max_results": "7", "paths": ""},
-    "Startup":     {"autostart": "false"},
+    "Startup":     {"autostart": "true"},
 }
 
 def _load_config():
@@ -178,27 +178,37 @@ def add_to_history(path: str):
 
 # ── Autostart ─────────────────────────────────────────────────────────────────
 
-def sync_autostart(enable: bool):
-    """Add or remove the Windows startup registry entry. Exe only."""
+def sync_autostart(enable: bool) -> bool:
+    """Add or remove the Windows startup registry entry. Exe only.
+
+    Returns True if the registry state matches intent, False if something
+    went wrong (e.g. permissions blocked the write).
+    """
     if not getattr(sys, "frozen", False):
-        return
+        return True
     try:
         import winreg
+        exe_path = str(Path(sys.executable))
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0, winreg.KEY_SET_VALUE,
+            0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
         )
         if enable:
-            winreg.SetValueEx(key, "CloudSearchBar", 0, winreg.REG_SZ, str(Path(sys.executable)))
+            winreg.SetValueEx(key, "CloudSearchBar", 0, winreg.REG_SZ, exe_path)
+            # Verify the write actually took effect
+            value, _ = winreg.QueryValueEx(key, "CloudSearchBar")
+            winreg.CloseKey(key)
+            return value == exe_path
         else:
             try:
                 winreg.DeleteValue(key, "CloudSearchBar")
             except FileNotFoundError:
                 pass
-        winreg.CloseKey(key)
+            winreg.CloseKey(key)
+            return True
     except Exception:
-        pass
+        return False
 
 
 # ── Preview popup ─────────────────────────────────────────────────────────────
@@ -292,7 +302,8 @@ class SearchBar(QWidget):
         self._init_ui()
         self._init_tray()
         self._init_hotkey()
-        sync_autostart(AUTOSTART)
+        if not sync_autostart(AUTOSTART) and AUTOSTART:
+            QTimer.singleShot(2000, self._warn_autostart_failed)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -491,6 +502,16 @@ class SearchBar(QWidget):
 
     def _init_hotkey(self):
         keyboard.add_hotkey(HOTKEY, self._signals.show_window.emit)
+
+    def _warn_autostart_failed(self):
+        self.tray.showMessage(
+            "CloudSearchBar — Autostart Warning",
+            "Could not write the startup registry entry. "
+            "CloudSearchBar may not launch automatically on login. "
+            "Try running as administrator.",
+            QSystemTrayIcon.MessageIcon.Warning,
+            6000,
+        )
 
     # ── Local search ──────────────────────────────────────────────────────────
 
