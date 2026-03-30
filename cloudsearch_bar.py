@@ -27,6 +27,8 @@ import urllib.parse
 import urllib.request
 import configparser
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 
@@ -54,6 +56,19 @@ def _app_dir() -> Path:
     return Path(__file__).parent
 
 APP_DIR = _app_dir()
+LOG_PATH = APP_DIR / "cloudsearch_bar.log"
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        RotatingFileHandler(LOG_PATH, maxBytes=500000, backupCount=2, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("CloudSearchBar")
+logger.info("Application starting...")
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -144,6 +159,7 @@ def search_local_files(query: str, paths: list, max_results: int) -> list:
         conn.Close()
         return results
     except Exception:
+        logger.exception("Windows Search query failed")
         return []
 
 
@@ -161,9 +177,12 @@ def fuzzy_rank(query: str, results: list, top_n: int) -> list:
 
 def load_history() -> list:
     try:
+        if not HISTORY_PATH.exists():
+            return []
         with open(HISTORY_PATH) as f:
             return json.load(f)
     except Exception:
+        logger.exception("Failed to load history")
         return []
 
 def add_to_history(path: str):
@@ -178,14 +197,17 @@ def add_to_history(path: str):
         with open(HISTORY_PATH, "w") as f:
             json.dump(entries[:HISTORY_MAX], f, indent=2)
     except Exception:
-        pass
+        logger.exception("Failed to save history")
 
 
 def load_query_history() -> list:
     try:
+        if not QUERY_HISTORY_PATH.exists():
+            return []
         with open(QUERY_HISTORY_PATH) as f:
             return json.load(f)
     except Exception:
+        logger.exception("Failed to load query history")
         return []
 
 def save_query(query: str):
@@ -198,7 +220,7 @@ def save_query(query: str):
         with open(QUERY_HISTORY_PATH, "w") as f:
             json.dump(entries[:QUERY_HISTORY_MAX], f, indent=2)
     except Exception:
-        pass
+        logger.exception("Failed to save query history")
 
 
 # ── Autostart ─────────────────────────────────────────────────────────────────
@@ -233,6 +255,7 @@ def sync_autostart(enable: bool) -> bool:
             winreg.CloseKey(key)
             return True
     except Exception:
+        logger.exception("Failed to sync autostart registry key")
         return False
 
 
@@ -259,7 +282,7 @@ def _nominatim_geocode(place: str):
         if data:
             return (float(data[0]["lat"]), float(data[0]["lon"]))
     except Exception:
-        pass
+        logger.error(f"Geocoding failed for place: {place}")
     return None
 
 
@@ -293,11 +316,10 @@ def _osrm_route(lat1, lon1, lat2, lon2):
         time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
         return {"distance_mi": miles, "distance_km": km, "time_str": time_str, "aerial": False}
     except Exception:
-        pass
+        logger.warning(f"OSRM routing failed, falling back to Haversine. Points: ({lat1},{lon1}) to ({lat2},{lon2})")
     # Haversine fallback — aerial (straight-line) distance
     miles = _haversine(lat1, lon1, lat2, lon2)
     return {"distance_mi": miles, "distance_km": miles * 1.60934, "aerial": True}
-    return None
 
 
 def _maps_url(origin: str, dest: str) -> str:
@@ -361,6 +383,7 @@ class PreviewPopup(QWidget):
             ext = p.suffix.upper().lstrip(".") or "File"
             meta = f"<b>{p.name}</b><br>{ext} · {size_str}<br>{modified}"
         except Exception:
+            logger.debug(f"Could not get file metadata for {path}")
             meta = p.name
 
         if p.suffix.lower() in IMAGE_EXTS:
@@ -604,9 +627,33 @@ class SettingsDialog(QDialog):
         if new_hotkey != old_hotkey:
             try:
                 keyboard.remove_hotkey(old_hotkey)
+                logger.info(f"Removed old hotkey: {old_hotkey}")
             except Exception:
-                pass
-            keyboard.add_hotkey(new_hotkey, self._bar._signals.show_window.emit)
+                logger.exception(f"Failed to remove old hotkey: {old_hotkey}")
+
+            try:
+                keyboard.add_hotkey(new_hotkey, self._bar._signals.show_window.emit)
+                logger.info(f"Added new hotkey: {new_hotkey}")
+            except Exception:
+                logger.exception(f"Failed to add new hotkey: {new_hotkey}")
+                # Roll back — restore the old hotkey so the user isn't left with nothing
+                try:
+                    keyboard.add_hotkey(old_hotkey, self._bar._signals.show_window.emit)
+                    logger.info(f"Rolled back to old hotkey: {old_hotkey}")
+                    HOTKEY = old_hotkey
+                    new_cfg["Search"]["hotkey"] = old_hotkey
+                    with open(CONFIG_PATH, "w") as f:
+                        new_cfg.write(f)
+                except Exception:
+                    logger.exception(f"Rollback also failed for hotkey: {old_hotkey}")
+                self._bar.tray.showMessage(
+                    "CloudSearchBar — Hotkey Error",
+                    f'Could not register hotkey "{new_hotkey}". '
+                    f'Reverted to "{old_hotkey}".',
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    6000,
+                )
+                return
 
         # Sync autostart registry if changed
         if new_autostart != old_autostart:
@@ -831,7 +878,12 @@ class SearchBar(QWidget):
     # ── Hotkey ────────────────────────────────────────────────────────────────
 
     def _init_hotkey(self):
-        keyboard.add_hotkey(HOTKEY, self._signals.show_window.emit)
+        try:
+            keyboard.add_hotkey(HOTKEY, self._signals.show_window.emit)
+            logger.info(f"Hotkey registered: {HOTKEY}")
+        except Exception:
+            logger.exception(f"Failed to register hotkey: {HOTKEY}")
+            QTimer.singleShot(2000, self._warn_hotkey_failed)
 
     def _warn_autostart_failed(self):
         self.tray.showMessage(
@@ -841,6 +893,15 @@ class SearchBar(QWidget):
             "Try running as administrator.",
             QSystemTrayIcon.MessageIcon.Warning,
             6000,
+        )
+
+    def _warn_hotkey_failed(self):
+        self.tray.showMessage(
+            "CloudSearchBar — Hotkey Error",
+            f'Could not register hotkey "{HOTKEY}". '
+            "Use the tray icon to open the bar, then fix the hotkey in Settings.",
+            QSystemTrayIcon.MessageIcon.Warning,
+            8000,
         )
 
     # ── Local search ──────────────────────────────────────────────────────────
@@ -1155,7 +1216,16 @@ class SearchBar(QWidget):
             self._cloud_search()
         else:
             save_query(self.line_edit.text().strip())
-            os.startfile(data)
+            try:
+                os.startfile(data)
+            except Exception:
+                logger.exception(f"Failed to open file: {data}")
+                self.tray.showMessage(
+                    "CloudSearchBar — Could Not Open File",
+                    f"File not found or could not be opened:\n{data}",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    5000,
+                )
             add_to_history(data)
             self._hide()
 
