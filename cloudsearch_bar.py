@@ -56,16 +56,41 @@ def _app_dir() -> Path:
     return Path(__file__).parent
 
 APP_DIR = _app_dir()
-LOG_PATH = APP_DIR / "cloudsearch_bar.log"
 
-# Setup logging
+def _pick_data_dir() -> Path:
+    """Writable home for config/history/log: the app dir when writable
+    (dev checkout, portable or per-user installs), else %LOCALAPPDATA%
+    (system-wide installs under Program Files)."""
+    try:
+        probe = APP_DIR / ".write_probe"
+        with open(probe, "w"):
+            pass
+        probe.unlink()
+        return APP_DIR
+    except OSError:
+        data_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudSearchBar"
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return APP_DIR  # writes will fail, but each write site is guarded
+        return data_dir
+
+DATA_DIR = _pick_data_dir()
+LOG_PATH = DATA_DIR / "cloudsearch_bar.log"
+
+# Setup logging. The file handler can fail (read-only medium); stdout is None
+# in a windowed (console=False) exe.
+_handlers = []
+try:
+    _handlers.append(RotatingFileHandler(LOG_PATH, maxBytes=500000, backupCount=2, encoding="utf-8"))
+except OSError:
+    pass
+if sys.stdout is not None:
+    _handlers.append(logging.StreamHandler(sys.stdout))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        RotatingFileHandler(LOG_PATH, maxBytes=500000, backupCount=2, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=_handlers or [logging.NullHandler()],
 )
 logger = logging.getLogger("CloudSearchBar")
 logger.info("Application starting...")
@@ -73,8 +98,9 @@ logger.info("Application starting...")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CONFIG_PATH  = APP_DIR / "cloudsearch_bar.ini"
-HISTORY_PATH = APP_DIR / "history.json"
+CONFIG_PATH  = DATA_DIR / "cloudsearch_bar.ini"
+_SEED_CONFIG = APP_DIR / "cloudsearch_bar.ini"   # installer drops the template next to the exe
+HISTORY_PATH = DATA_DIR / "history.json"
 
 _DEFAULTS = {
     "Search":      {"hotkey": "ctrl+space", "account_index": "0", "browser": ""},
@@ -87,22 +113,42 @@ def _load_config():
     cfg = configparser.ConfigParser()
     for section, values in _DEFAULTS.items():
         cfg[section] = values
+    sources = []
+    if _SEED_CONFIG != CONFIG_PATH and _SEED_CONFIG.exists():
+        sources.append(_SEED_CONFIG)
     if CONFIG_PATH.exists():
-        cfg.read(CONFIG_PATH)
+        sources.append(CONFIG_PATH)
+    try:
+        cfg.read(sources)
+    except configparser.Error:
+        logger.exception("Malformed config file, using defaults")
     return cfg
 
 cfg = _load_config()
 
-HOTKEY        = cfg.get("Search", "hotkey").strip()
-ACCOUNT_INDEX = cfg.getint("Search", "account_index")
-BROWSER       = cfg.get("Search", "browser").strip()
-WINDOW_WIDTH  = cfg.getint("Window", "width")
-WINDOW_HEIGHT = cfg.getint("Window", "height")
-LOCAL_ENABLED = cfg.getboolean("LocalSearch", "enabled")
-LOCAL_MAX     = cfg.getint("LocalSearch", "max_results")
-_raw_paths    = cfg.get("LocalSearch", "paths").strip()
+def _cfg_value(section: str, option: str, cast=str):
+    """Read a config value, falling back to the default if malformed."""
+    try:
+        if cast is bool:
+            return cfg.getboolean(section, option)
+        if cast is int:
+            return cfg.getint(section, option)
+        return cfg.get(section, option)
+    except (ValueError, configparser.Error):
+        logger.warning(f"Invalid config value for [{section}] {option}, using default")
+        raw = _DEFAULTS[section][option]
+        return raw == "true" if cast is bool else cast(raw)
+
+HOTKEY        = _cfg_value("Search", "hotkey").strip()
+ACCOUNT_INDEX = _cfg_value("Search", "account_index", int)
+BROWSER       = _cfg_value("Search", "browser").strip()
+WINDOW_WIDTH  = _cfg_value("Window", "width", int)
+WINDOW_HEIGHT = _cfg_value("Window", "height", int)
+LOCAL_ENABLED = _cfg_value("LocalSearch", "enabled", bool)
+LOCAL_MAX     = max(1, _cfg_value("LocalSearch", "max_results", int))
+_raw_paths    = _cfg_value("LocalSearch", "paths").strip()
 LOCAL_PATHS   = [p.strip() for p in _raw_paths.split(",") if p.strip()] if _raw_paths else []
-AUTOSTART     = cfg.getboolean("Startup", "autostart")
+AUTOSTART     = _cfg_value("Startup", "autostart", bool)
 
 _account_path = f"/u/{ACCOUNT_INDEX}/" if ACCOUNT_INDEX > 0 else "/"
 SEARCH_URL    = f"https://cloudsearch.google.com{_account_path}cloudsearch/search?q={{}}"
@@ -114,7 +160,7 @@ ITEM_HEIGHT     = 54
 HEADER_HEIGHT   = 28
 HISTORY_MAX          = 20
 HISTORY_SHOW         = 5
-QUERY_HISTORY_PATH   = APP_DIR / "query_history.json"
+QUERY_HISTORY_PATH   = DATA_DIR / "query_history.json"
 QUERY_HISTORY_MAX    = 100
 IMAGE_EXTS      = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
 
@@ -128,15 +174,29 @@ def search_local_files(query: str, paths: list, max_results: int) -> list:
     Returns a list of (filename, full_path) tuples.
     """
     try:
+        import pythoncom
         import win32com.client
-        safe_query = query.replace("'", "''")
+        # COM must be initialized on every thread that uses it; each search
+        # runs on a fresh worker thread.
+        pythoncom.CoInitialize()
+    except Exception:
+        logger.exception("Windows Search COM initialization failed")
+        return []
+    try:
+        # Escape quotes and LIKE wildcards (%, _, [) in the user's query
+        safe_query = (
+            query.replace("'", "''")
+                 .replace("[", "[[]")
+                 .replace("%", "[%]")
+                 .replace("_", "[_]")
+        )
         conn = win32com.client.Dispatch("ADODB.Connection")
         conn.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
         rs = win32com.client.Dispatch("ADODB.Recordset")
 
         scope_clause = ""
         if paths:
-            parts = " OR ".join(f"scope='file:{p}'" for p in paths)
+            parts = " OR ".join("scope='file:{}'".format(p.replace("'", "''")) for p in paths)
             scope_clause = f"AND ({parts})"
 
         fetch_limit = max_results * 4
@@ -161,6 +221,8 @@ def search_local_files(query: str, paths: list, max_results: int) -> list:
     except Exception:
         logger.exception("Windows Search query failed")
         return []
+    finally:
+        pythoncom.CoUninitialize()
 
 
 # ── Fuzzy ranking ─────────────────────────────────────────────────────────────
@@ -193,6 +255,15 @@ def add_to_history(path: str):
         "name": Path(path).name,
         "opened": datetime.now().isoformat(),
     })
+    try:
+        with open(HISTORY_PATH, "w") as f:
+            json.dump(entries[:HISTORY_MAX], f, indent=2)
+    except Exception:
+        logger.exception("Failed to save history")
+
+
+def remove_from_history(path: str):
+    entries = [e for e in load_history() if e.get("path") != path]
     try:
         with open(HISTORY_PATH, "w") as f:
             json.dump(entries[:HISTORY_MAX], f, indent=2)
@@ -609,8 +680,18 @@ class SettingsDialog(QDialog):
         new_cfg["Startup"] = {
             "autostart": "true" if new_autostart else "false",
         }
-        with open(CONFIG_PATH, "w") as f:
-            new_cfg.write(f)
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                new_cfg.write(f)
+        except OSError:
+            logger.exception(f"Failed to write config file: {CONFIG_PATH}")
+            self._bar.tray.showMessage(
+                "CloudSearchBar — Settings Warning",
+                "Could not write the config file. Settings will apply "
+                "until the app restarts, but won't be saved.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                6000,
+            )
 
         # Update globals
         HOTKEY        = new_hotkey
@@ -630,6 +711,12 @@ class SettingsDialog(QDialog):
                 logger.info(f"Removed old hotkey: {old_hotkey}")
             except Exception:
                 logger.exception(f"Failed to remove old hotkey: {old_hotkey}")
+                # Don't leave both hotkeys bound — this app only ever
+                # registers one, so clearing all is safe.
+                try:
+                    keyboard.unhook_all_hotkeys()
+                except Exception:
+                    logger.exception("Failed to clear hotkeys")
 
             try:
                 keyboard.add_hotkey(new_hotkey, self._bar._signals.show_window.emit)
@@ -642,8 +729,11 @@ class SettingsDialog(QDialog):
                     logger.info(f"Rolled back to old hotkey: {old_hotkey}")
                     HOTKEY = old_hotkey
                     new_cfg["Search"]["hotkey"] = old_hotkey
-                    with open(CONFIG_PATH, "w") as f:
-                        new_cfg.write(f)
+                    try:
+                        with open(CONFIG_PATH, "w") as f:
+                            new_cfg.write(f)
+                    except OSError:
+                        logger.exception(f"Failed to write config file: {CONFIG_PATH}")
                 except Exception:
                     logger.exception(f"Rollback also failed for hotkey: {old_hotkey}")
                 self._bar.tray.showMessage(
@@ -659,6 +749,7 @@ class SettingsDialog(QDialog):
         if new_autostart != old_autostart:
             sync_autostart(new_autostart)
 
+        self._bar._update_tray_hotkey(HOTKEY)
         self.accept()
 
 
@@ -839,11 +930,23 @@ class SearchBar(QWidget):
         if not self.results_list.isVisible():
             return
         item = self.results_list.currentItem()
-        if item:
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if path:
-                os.startfile(str(Path(path).parent))
-                self._hide()
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        # Only file results — suggestion rows carry a dict, distance rows a URL
+        if not isinstance(path, str) or path.startswith("https://"):
+            return
+        try:
+            os.startfile(str(Path(path).parent))
+        except Exception:
+            logger.exception(f"Failed to open folder for: {path}")
+            self.tray.showMessage(
+                "CloudSearchBar — Could Not Open Folder",
+                f"Folder not found or could not be opened:\n{Path(path).parent}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+        self._hide()
 
     def _center(self):
         screen = QApplication.primaryScreen().geometry()
@@ -860,16 +963,22 @@ class SearchBar(QWidget):
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip(f"Cloud Search  ({HOTKEY})")
 
-        menu = QMenu()
-        menu.addAction(f"Show  ({HOTKEY})").triggered.connect(self._show_and_focus)
-        menu.addSeparator()
-        menu.addAction("Open settings…").triggered.connect(self._open_settings)
-        menu.addSeparator()
-        menu.addAction("Quit").triggered.connect(QApplication.quit)
+        # Keep references — setContextMenu() does not take ownership
+        self._tray_menu = QMenu()
+        self._show_action = self._tray_menu.addAction(f"Show  ({HOTKEY})")
+        self._show_action.triggered.connect(self._show_and_focus)
+        self._tray_menu.addSeparator()
+        self._tray_menu.addAction("Open settings…").triggered.connect(self._open_settings)
+        self._tray_menu.addSeparator()
+        self._tray_menu.addAction("Quit").triggered.connect(QApplication.quit)
 
-        self.tray.setContextMenu(menu)
+        self.tray.setContextMenu(self._tray_menu)
         self.tray.activated.connect(self._on_tray_click)
         self.tray.show()
+
+    def _update_tray_hotkey(self, hotkey: str):
+        self.tray.setToolTip(f"Cloud Search  ({hotkey})")
+        self._show_action.setText(f"Show  ({hotkey})")
 
     def _on_tray_click(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -910,6 +1019,10 @@ class SearchBar(QWidget):
         self._search_timer.stop()
         if text.strip():
             self._show_query_suggestions(text.strip())
+            # Distance queries hit the OSM geocoder (1 req/sec policy) —
+            # debounce them harder than local file searches
+            is_distance = bool(_DISTANCE_RE.match(text.strip()))
+            self._search_timer.setInterval(1000 if is_distance else 250)
             self._search_timer.start()
         else:
             self._clear_results()
@@ -1024,7 +1137,10 @@ class SearchBar(QWidget):
         history = load_history()
         if not history:
             return
-        items = [(e["name"], e["path"]) for e in history[:HISTORY_SHOW] if Path(e["path"]).exists()]
+        # No existence check here — Path.exists() can block for seconds on
+        # unreachable network paths, and this runs on the GUI thread every
+        # time the bar is shown. Stale entries are pruned when opening fails.
+        items = [(e["name"], e["path"]) for e in history[:HISTORY_SHOW]]
         if not items:
             return
         self._populate_list(
@@ -1122,7 +1238,8 @@ class SearchBar(QWidget):
 
     def _on_item_hovered(self, item: QListWidgetItem):
         path = item.data(Qt.ItemDataRole.UserRole)
-        if not path or (isinstance(path, str) and path.startswith("https://")):
+        # Only file results — suggestion rows carry a dict, distance rows a URL
+        if not isinstance(path, str) or not path or path.startswith("https://"):
             self._preview.hide()
             return
         rect       = self.results_list.visualItemRect(item)
@@ -1226,7 +1343,9 @@ class SearchBar(QWidget):
                     QSystemTrayIcon.MessageIcon.Warning,
                     5000,
                 )
-            add_to_history(data)
+                remove_from_history(data)
+            else:
+                add_to_history(data)
             self._hide()
 
     def _cloud_search(self):
@@ -1247,7 +1366,21 @@ class SearchBar(QWidget):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+_instance_mutex = None  # keep the handle alive for the process lifetime
+
+def _acquire_single_instance() -> bool:
+    """Create a named mutex; returns False if another instance holds it."""
+    global _instance_mutex
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    _instance_mutex = kernel32.CreateMutexW(None, False, "CloudSearchBar_SingleInstance")
+    return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+
 if __name__ == "__main__":
+    if not _acquire_single_instance():
+        logger.info("Another instance is already running — exiting.")
+        sys.exit(0)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     bar = SearchBar()

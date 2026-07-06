@@ -2,5 +2,6 @@ build/
 dist/
 history.json
 query_history.json
+*.log
 *.pyc
 __pycache__/
