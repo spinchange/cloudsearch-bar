@@ -4,6 +4,23 @@ All notable changes to CloudSearchBar are listed here.
 
 ---
 
+## [1.1.1] — 2026-07-06
+
+### Fixed
+- **Crash on "Recent searches" rows** — hovering or pressing Shift+Enter on a query suggestion (or a distance result) aborted the app; these handlers now only act on real file paths, and folder-open failures show a tray warning instead of crashing.
+- **Local file search stopped working after the first query** — COM is now initialized on every search worker thread (`CoInitialize`), so Windows Search results keep coming instead of silently going empty.
+- **System-wide installs broke startup and settings** — config, history, and log now fall back to `%LOCALAPPDATA%\CloudSearchBar` when the install folder isn't writable (e.g. Program Files); settings-save failures warn instead of crashing.
+- **Malformed ini values killed startup** — invalid config values now fall back to defaults with a logged warning.
+- **Failed file opens polluted history** — files that fail to open are removed from "Recently opened" instead of re-added, and showing the bar no longer checks file existence on the GUI thread (which could hang on dead network paths).
+- **Stale tray labels after hotkey change** — the tray tooltip and "Show" menu entry now update immediately when the hotkey is changed in Settings.
+
+### Changed
+- **Single-instance guard** — a second launch now exits immediately instead of running a duplicate.
+- **Distance queries debounce at 1s** (file searches remain 250ms) to respect the OSM Nominatim rate policy.
+- **Windows Search queries escape LIKE wildcards** (`%`, `_`, `[`) so they match literally instead of acting as wildcards.
+
+---
+
 ## [1.1.0] — 2026-02-26
 
 ### Added

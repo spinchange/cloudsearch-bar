@@ -1,6 +1,6 @@
 [Setup]
 AppName=Cloud Search Bar
-AppVersion=1.0
+AppVersion=1.1.1
 AppPublisher=Chris Duffy
 AppPublisherURL=
 AppSupportURL=
